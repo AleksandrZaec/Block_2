@@ -28,7 +28,7 @@ def get_reports():
         links = [link['href'] for link in links]
         for link in links:
             try:
-                if int(link.split("oil_xls_")[1][:4]) < 2025:
+                if int(link.split("oil_xls_")[1][:4]) < 2023:
                     return reports
                 reports.append(link)
             except Exception as e:
