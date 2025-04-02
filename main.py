@@ -1,12 +1,11 @@
 import io
 import pandas as pd
 import requests
-from datetime import datetime
 import time
 from bs4 import BeautifulSoup
-from database import Session, BaseModel, engine
-from models import SpimexTradingResult
-import numpy as np
+import datetime
+from models import SpimexTradingResults
+from database import Session, Base, engine
 
 BASE_URL = "https://spimex.com"
 RESULTS_URL = "https://spimex.com/markets/oil_products/trades/results/"
@@ -29,7 +28,7 @@ def get_reports():
         links = [link['href'] for link in links]
         for link in links:
             try:
-                if int(link.split("oil_xls_")[1][:4]) < 2023:
+                if int(link.split("oil_xls_")[1][:4]) < 2025:
                     return reports
                 reports.append(link)
             except Exception as e:
@@ -43,25 +42,39 @@ def process_report(url):
     response = requests.get(BASE_URL + url)
     response.raise_for_status()
 
-    report_date_str = url.split("oil_xls_")[1][:8]
-    report_date = datetime.strptime(report_date_str, '%Y%m%d').date()
+    report_date = url.split("oil_xls_")[1][:8]
+    report_date = datetime.date(int(report_date[:4]), int(report_date[4:6]), int(report_date[6:]))
     print(f"Processing report: {report_date}")
 
     data = io.BytesIO(response.content)
 
-    xls = pd.ExcelFile(data)
-    sheet_name = 'TRADE_SUMMARY' if 'TRADE_SUMMARY' in xls.sheet_names else xls.sheet_names[0]
-    df = pd.read_excel(data, sheet_name=sheet_name, header=None)
-    start_row = df[df[1].str.contains('Единица измерения: Метрическая тонна', na=False)].index[0] + 2
-    headers = df.iloc[start_row].values
-    df = pd.read_excel(data, sheet_name=sheet_name, header=start_row + 1)
-    df = df[df.iloc[:, -1] != "-"]
-    df = df.dropna(subset=[df.columns[0], df.columns[1], df.columns[2]])
-    numeric_cols = [3, 4, -1]
-    for col in numeric_cols:
-        df[df.columns[col]] = df[df.columns[col]].replace("-", np.nan)
+    start_marker = "Единица измерения: Метрическая тонна"
+    end_marker = "Итого:"
+    skiprows = None
 
-    return df, report_date
+    with pd.ExcelFile(data) as xls:
+        for sheet_name in xls.sheet_names:
+            sheet_data = pd.read_excel(xls, sheet_name=sheet_name, header=None)
+            try:
+                start_row = sheet_data[sheet_data.eq(start_marker).any(axis=1)].index[0]
+                skiprows = start_row + 2
+                break
+            except IndexError:
+                continue
+
+    if skiprows is None:
+        raise ValueError("Кривой файл excel")
+
+    report_df = pd.read_excel(data, skiprows=skiprows)
+
+    end_row = report_df[report_df.eq(end_marker).any(axis=1)].index[0]
+    report_df = report_df.iloc[:end_row]
+
+    report_df = report_df.drop(report_df.columns[0], axis=1)
+
+    report_df = report_df[report_df.iloc[:, -1] != "-"]
+
+    return report_df, report_date
 
 
 def write_to_db(dataframe, report_date):
@@ -70,54 +83,63 @@ def write_to_db(dataframe, report_date):
     records = []
 
     for _, row in dataframe.iterrows():
+
         try:
-            volume = int(row.iloc[3]) if pd.notna(row.iloc[3]) else None
-            total = int(row.iloc[4]) if pd.notna(row.iloc[4]) else None
-            count = int(row.iloc[-1]) if pd.notna(row.iloc[-1]) else None
+            exchange_product_id = str(row.iloc[0]).strip()
+            exchange_product_name = str(row.iloc[1]).strip()
+            delivery_basis_name = str(row.iloc[2]).strip()
 
-            exchange_product_id = str(row.iloc[0])
             oil_id = exchange_product_id[:4]
-            delivery_basis_id = exchange_product_id[4:7] if len(exchange_product_id) >= 7 else None
-            delivery_type_id = exchange_product_id[-1] if len(exchange_product_id) >= 1 else None
+            delivery_basis_id = exchange_product_id[4:7]
+            delivery_type_id = exchange_product_id[-1]
 
-            records.append(SpimexTradingResult(
+            try:
+                volume_value = int(row.iloc[3]) if pd.notna(row.iloc[3]) else None
+            except ValueError:
+                volume_value = None
+
+            try:
+                total_value = float(row.iloc[4]) if pd.notna(row.iloc[4]) else None
+            except ValueError:
+                total_value = None
+
+            try:
+                count_value = int(row.iloc[-1]) if pd.notna(row.iloc[-1]) else None
+            except ValueError:
+                count_value = None
+
+            record = SpimexTradingResults(
                 exchange_product_id=exchange_product_id,
-                exchange_product_name=str(row.iloc[1]),
+                exchange_product_name=exchange_product_name,
                 oil_id=oil_id,
                 delivery_basis_id=delivery_basis_id,
-                delivery_basis_name=str(row.iloc[2]),
+                delivery_basis_name=delivery_basis_name,
                 delivery_type_id=delivery_type_id,
-                volume=volume,
-                total=total,
-                count=count,
+                volume=volume_value,
+                total=total_value,
+                count=count_value,
                 date=report_date
-            ))
-        except Exception as e:
-            print(f"Error processing row: {row}. Error: {e}")
+            )
+
+            records.append(record)
+
+        except IndexError as e:
+            print(f"Ошибка при обработке строки: {e}")
             continue
 
-    try:
-        session = Session()
-        session.add_all(records)
-        session.commit()
-    except Exception as e:
-        session.rollback()
-        print(f"Error committing to DB: {e}")
-    finally:
-        session.close()
+    session = Session()
+    session.add_all(records)
+    session.commit()
+    session.close()
 
 
 if __name__ == "__main__":
     start_time = time.time()
-    BaseModel.metadata.create_all(bind=engine)
+    Base.metadata.create_all(bind=engine)
     reports = get_reports()
     for report in reports:
-        try:
-            df, date = process_report(report)
-            write_to_db(df, date)
-        except Exception as e:
-            print(f"Error processing report {report}: {e}")
-            continue
+        df, date = process_report(report)
+        write_to_db(df, date)
 
     finish_time = time.time() - start_time
-    print(f"Total time: {finish_time} seconds")
+    print(f"Время выполнения: {finish_time} сек.")
